@@ -18,8 +18,9 @@ const metaplex = Metaplex.make(connection);
 app.get('/', (req, res) => {
     res.json({ message: "Solana Unified API (Metaplex & Token-2022) is running successfully!" });
 });
+// أضف هذا التعريف خارج المسار لاستخدامه في جلب عنوان Metaplex
+const METAPLEX_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
 
-// مسار جلب البيانات
 app.get('/api/token/:mintAddress', async (req, res) => {
     try {
         const { mintAddress } = req.params;
@@ -31,7 +32,6 @@ app.get('/api/token/:mintAddress', async (req, res) => {
             return res.status(400).json({ success: false, error: 'عنوان العقد غير صالح.' });
         }
 
-        // هيكل مبدئي للبيانات لتخزين النتيجة النهائية
         let tokenDataResult = {
             name: '',
             ticker: '',
@@ -42,38 +42,62 @@ app.get('/api/token/:mintAddress', async (req, res) => {
         let isFound = false;
 
         // ---------------------------------------------------------
-        // 1. المحاولة الأولى: فحص إذا كانت العملة Token-2022
+        // 1. تحديد البرنامج المالك للعقد (Token أو Token-2022)
         // ---------------------------------------------------------
-        try {
-            const token2022Metadata = await getTokenMetadata(connection, mintPubkey);
-            
-            if (token2022Metadata) {
-                tokenDataResult.name = token2022Metadata.name;
-                tokenDataResult.ticker = token2022Metadata.symbol;
+        const accountInfo = await connection.getAccountInfo(mintPubkey);
+        if (!accountInfo) {
+            return res.status(404).json({ success: false, error: 'العملة غير موجودة على الشبكة.' });
+        }
+        const programId = accountInfo.owner; 
+
+        // ---------------------------------------------------------
+        // 2. المحاولة الأولى: جلب البيانات المدمجة (لعملات Token-2022 فقط)
+        // ---------------------------------------------------------
+        if (programId.toBase58() === 'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb') {
+            try {
+                // من الضروري تمرير programId للدالة لتعمل بشكل صحيح مع 2022
+                const token2022Metadata = await getTokenMetadata(connection, mintPubkey, 'confirmed', programId);
                 
-                // التوكنات 2022 تخزن رابط JSON في خانة "uri"
-                if (token2022Metadata.uri) {
-                    try {
-                        const response = await fetch(token2022Metadata.uri);
-                        const jsonMeta = await response.json();
-                        tokenDataResult.description = jsonMeta.description || tokenDataResult.description;
-                        tokenDataResult.image = jsonMeta.image || tokenDataResult.image;
-                    } catch (fetchErr) {
-                        console.error('فشل في جلب الرابط الخارجي (URI) لـ Token-2022');
+                if (token2022Metadata) {
+                    tokenDataResult.name = token2022Metadata.name;
+                    tokenDataResult.ticker = token2022Metadata.symbol;
+                    
+                    if (token2022Metadata.uri) {
+                        try {
+                            const response = await fetch(token2022Metadata.uri);
+                            const jsonMeta = await response.json();
+                            tokenDataResult.description = jsonMeta.description || tokenDataResult.description;
+                            tokenDataResult.image = jsonMeta.image || tokenDataResult.image;
+                        } catch (fetchErr) {
+                            console.error('فشل في جلب الرابط الخارجي (URI) لـ Token-2022');
+                        }
                     }
+                    isFound = true;
                 }
-                isFound = true;
+            } catch (err) {
+                // نتجاهل الخطأ وننتقل للبحث في Metaplex
+                console.log("لم يتم العثور على بيانات مدمجة، جاري التحقق من Metaplex...");
             }
-        } catch (err) {
-            // سيحدث خطأ هنا طبيعياً إذا لم تكن العملة Token-2022، لذا سنتجاهله للمحاولة الثانية
         }
 
         // ---------------------------------------------------------
-        // 2. المحاولة الثانية: استخدام Metaplex (للتوكنات العادية)
+        // 3. المحاولة الثانية: جلب البيانات عبر Metaplex PDA 
+        // (تعمل لكل من التوكن العادي و 2022 التي تستخدم MetadataPointer)
         // ---------------------------------------------------------
         if (!isFound) {
             try {
-                const tokenData = await metaplex.nfts().findByMint({ mintAddress: mintPubkey });
+                // اشتقاق عنوان الحساب الخاص بالـ Metadata يدوياً لتجاوز أخطاء `findByMint`
+                const [metadataPDA] = PublicKey.findProgramAddressSync(
+                    [
+                        Buffer.from('metadata'),
+                        METAPLEX_PROGRAM_ID.toBuffer(),
+                        mintPubkey.toBuffer()
+                    ],
+                    METAPLEX_PROGRAM_ID
+                );
+
+                // جلب البيانات الوصفية باستخدام الـ PDA بدلاً من عنوان العقد
+                const tokenData = await metaplex.nfts().findByMetadata({ metadata: metadataPDA });
                 
                 tokenDataResult.name = tokenData.name;
                 tokenDataResult.ticker = tokenData.symbol;
@@ -82,12 +106,12 @@ app.get('/api/token/:mintAddress', async (req, res) => {
                 
                 isFound = true;
             } catch (err) {
-                // سيحدث خطأ إذا لم يتم العثور على العملة في نظام Metaplex
+                // لم يتم العثور على بيانات في Metaplex
             }
         }
 
         // ---------------------------------------------------------
-        // 3. التحقق النهائي وإرسال النتيجة
+        // 4. التحقق النهائي وإرسال النتيجة
         // ---------------------------------------------------------
         if (!isFound) {
             return res.status(404).json({ 
@@ -106,7 +130,6 @@ app.get('/api/token/:mintAddress', async (req, res) => {
         res.status(500).json({ success: false, error: 'حدث خطأ داخلي في الخادم.' });
     }
 });
-
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
