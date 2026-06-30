@@ -1,4 +1,19 @@
 const express = require('express');
+const cors = require('cors'); // استيراد المكتبة
+const app = express();
+
+// إعداد CORS للسماح بالطلبات من أي مصدر
+const corsOptions = {
+  origin: '*', // يسمح لأي موقع بالاتصال (أو يمكنك وضع رابط موقعك المحدد هنا لمزيد من الأمان)
+  methods: ['GET', 'POST', 'OPTIONS'], // تحديد الطرق المسموحة
+  allowedHeaders: ['Content-Type', 'Authorization'], // تحديد الهيدرات المسموحة
+  optionsSuccessStatus: 200 // لبعض المتصفحات القديمة
+};
+
+app.use(cors(corsOptions)); // تفعيل الـ Middleware
+app.use(express.json()); // ضروري لقراءة بيانات JSON القادمة من الـ PHP أو الـ Frontend
+
+const express = require('express');
 const cors = require('cors');
 const { 
     Connection, 
