@@ -1,19 +1,4 @@
 const express = require('express');
-const cors = require('cors'); // استيراد المكتبة
-const app = express();
-
-// إعداد CORS للسماح بالطلبات من أي مصدر
-const corsOptions = {
-  origin: '*', // يسمح لأي موقع بالاتصال (أو يمكنك وضع رابط موقعك المحدد هنا لمزيد من الأمان)
-  methods: ['GET', 'POST', 'OPTIONS'], // تحديد الطرق المسموحة
-  allowedHeaders: ['Content-Type', 'Authorization'], // تحديد الهيدرات المسموحة
-  optionsSuccessStatus: 200 // لبعض المتصفحات القديمة
-};
-
-app.use(cors(corsOptions)); // تفعيل الـ Middleware
-app.use(express.json()); // ضروري لقراءة بيانات JSON القادمة من الـ PHP أو الـ Frontend
-
-const express = require('express');
 const cors = require('cors');
 const { 
     Connection, 
@@ -28,29 +13,33 @@ const {
     getTokenMetadata, 
     getAssociatedTokenAddressSync, 
     createAssociatedTokenAccountInstruction, 
-    createTransferCheckedInstruction,
-    TOKEN_PROGRAM_ID, 
-    TOKEN_2022_PROGRAM_ID 
+    createTransferCheckedWithTransferHookInstruction, // الدالة المخصصة للـ Hooks
+    TOKEN_2022_PROGRAM_ID,
+    TOKEN_PROGRAM_ID
 } = require('@solana/spl-token');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+// إعداد CORS للسماح بالطلبات من أي مصدر (بما فيها المتصفح أثناء التطوير)
+const corsOptions = {
+  origin: '*', 
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  optionsSuccessStatus: 200
+};
 
-// الاتصال بشبكة Devnet
+app.use(cors(corsOptions)); 
+app.use(express.json()); 
+
+// الاتصال بشبكة Devnet (يمكنك تغييرها إلى mainnet-beta لاحقاً)
 const connection = new Connection(clusterApiUrl('devnet'), 'confirmed');
 const metaplex = Metaplex.make(connection);
-
 const METAPLEX_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
 
-// عناوين افتراضية للعملات الخاصة بالمعاملات المركبة (استبدلها بعناوين عقودك الفعلية)
-const RHL_MINT = new PublicKey("Hpt8Z2...YourRhlMintAddress..."); 
-const VOLT_MINT = new PublicKey("VLT8zQ...YourVoltMintAddress...");
-const VOLT_TREASURY = new PublicKey("Trs8xP...YourVoltTreasuryAddress..."); // الجهة التي تذهب إليها عملات VOLT المستهلكة
-
+// ==========================================
 // 1. مسار جلب البيانات الوصفية للعملة
+// ==========================================
 app.get('/api/token/:mintAddress', async (req, res) => {
     try {
         const { mintAddress } = req.params;
@@ -77,6 +66,7 @@ app.get('/api/token/:mintAddress', async (req, res) => {
         }
         const programId = accountInfo.owner; 
 
+        // محاولة جلب البيانات إذا كانت Token-2022
         if (programId.toBase58() === TOKEN_2022_PROGRAM_ID.toBase58()) {
             try {
                 const token2022Metadata = await getTokenMetadata(connection, mintPubkey, 'confirmed', programId);
@@ -101,6 +91,7 @@ app.get('/api/token/:mintAddress', async (req, res) => {
             }
         }
 
+        // محاولة جلب البيانات من Metaplex إذا كانت من المعيار القديم
         if (!isFound) {
             try {
                 const [metadataPDA] = PublicKey.findProgramAddressSync(
@@ -132,67 +123,74 @@ app.get('/api/token/:mintAddress', async (req, res) => {
     }
 });
 
-// 2. إنشاء المعاملة غير الموقعة (مبنية بالكامل على السيرفر)
+// ==========================================
+// 2. إنشاء المعاملة غير الموقعة (مبنية ديناميكياً وتدعم الـ Hooks)
+// ==========================================
 app.post('/api/transaction/create', async (req, res) => {
     try {
-        const { sender, receiver, mint, amount, decimals } = req.body;
+        const { sender, transfers } = req.body;
 
-        if (!sender || !receiver || !mint || !amount) {
-            return res.status(400).json({ success: false, error: 'المعاملات المطلوبة غير مكتملة.' });
+        if (!sender || !Array.isArray(transfers) || transfers.length === 0) {
+            return res.status(400).json({ success: false, error: 'بيانات المعاملة غير صحيحة أو مفقودة.' });
         }
 
         const senderPubkey = new PublicKey(sender);
-        const receiverPubkey = new PublicKey(receiver);
         const instructions = [];
 
-        // أخذ أحدث Blockhash من الشبكة
         const { blockhash } = await connection.getLatestBlockhash('confirmed');
 
-        // أ) التحقق وإعداد تحويل العملة الأساسية SOL
-        if (mint === 'SOL') {
-            const lamports = Math.round(parseFloat(amount) * 1e9);
-            instructions.push(
-                SystemProgram.transfer({
-                    fromPubkey: senderPubkey,
-                    toPubkey: receiverPubkey,
-                    lamports: lamports
-                })
-            );
-        } else {
-            // ب) إعداد تحويل توكن (SPL أو Token-2022)
-            const mintPubkey = new PublicKey(mint);
+        for (const transfer of transfers) {
+            const { receiver, mint, amount, decimals } = transfer;
             
-            // تحديد البرنامج المالك لتوكن (معيار قديم أم 2022)
-            const mintAccountInfo = await connection.getAccountInfo(mintPubkey);
-            if (!mintAccountInfo) {
-                return res.status(404).json({ success: false, error: 'عقد التوكن غير موجود.' });
+            if (!receiver || !mint || !amount) {
+                throw new Error("بعض بيانات التحويل مفقودة في المصفوفة.");
             }
-            const tokenProgramId = mintAccountInfo.owner;
 
-            // اشتقاق حسابات الـ ATA للطرفين
-            const senderATA = getAssociatedTokenAddressSync(mintPubkey, senderPubkey, false, tokenProgramId);
-            const receiverATA = getAssociatedTokenAddressSync(mintPubkey, receiverPubkey, false, tokenProgramId);
+            const receiverPubkey = new PublicKey(receiver);
 
-            // التحقق تلقائياً من وجود حساب ATA للمستلم، وإنشائه إذا كان مفقوداً
-            const receiverAtaInfo = await connection.getAccountInfo(receiverATA);
-            if (!receiverAtaInfo) {
+            // أ) تحويل SOL الأساسي
+            if (mint === 'SOL') {
+                const lamports = Math.round(parseFloat(amount) * 1e9);
                 instructions.push(
-                    createAssociatedTokenAccountInstruction(
-                        senderPubkey, // دافع رسوم إنشاء الحساب
-                        receiverATA,
-                        receiverPubkey,
-                        mintPubkey,
-                        tokenProgramId
-                    )
+                    SystemProgram.transfer({
+                        fromPubkey: senderPubkey,
+                        toPubkey: receiverPubkey,
+                        lamports: lamports
+                    })
                 );
-            }
+            } 
+            // ب) تحويل توكن (يدعم Token-2022 والـ Transfer Hooks)
+            else {
+                const mintPubkey = new PublicKey(mint);
+                const mintAccountInfo = await connection.getAccountInfo(mintPubkey);
+                
+                if (!mintAccountInfo) {
+                    throw new Error(`عقد التوكن ${mint} غير موجود.`);
+                }
+                const tokenProgramId = mintAccountInfo.owner; // سيحدد تلقائياً هل هو 2022 أم المعيار القديم
 
-            // حساب الكمية الدقيقة بناءً على الديسيمالز للتوكن
-            const rawAmount = Math.round(parseFloat(amount) * Math.pow(10, parseInt(decimals || 0)));
+                const senderATA = getAssociatedTokenAddressSync(mintPubkey, senderPubkey, false, tokenProgramId);
+                const receiverATA = getAssociatedTokenAddressSync(mintPubkey, receiverPubkey, false, tokenProgramId);
 
-            // إدراج تعليمة التحويل الآمنة المتوافقة مع الـ Transfer Fees وضريبة الـ Token-2022
-            instructions.push(
-                createTransferCheckedInstruction(
+                // التأكد من وجود حساب ATA للمستلم
+                const receiverAtaInfo = await connection.getAccountInfo(receiverATA);
+                if (!receiverAtaInfo) {
+                    instructions.push(
+                        createAssociatedTokenAccountInstruction(
+                            senderPubkey,
+                            receiverATA,
+                            receiverPubkey,
+                            mintPubkey,
+                            tokenProgramId
+                        )
+                    );
+                }
+
+                const rawAmount = Math.round(parseFloat(amount) * Math.pow(10, parseInt(decimals || 0)));
+
+                // استخدام الدالة الذكية التي تتخاطب مع العقد لمعرفة الحسابات الإضافية المطلوبة
+                const transferInstruction = await createTransferCheckedWithTransferHookInstruction(
+                    connection,
                     senderATA,
                     mintPubkey,
                     receiverATA,
@@ -200,42 +198,15 @@ app.post('/api/transaction/create', async (req, res) => {
                     rawAmount,
                     parseInt(decimals || 0),
                     [],
+                    'confirmed',
                     tokenProgramId
-                )
-            );
-
-            // ج) التعامل مع العمليات المركبة (Multi-Instruction)
-            // مثال: إذا قام بطلب إرسال عملة RHL، نقوم تلقائياً بخصم/استهلاك كمية محددة من عملة VOLT
-            if (mintPubkey.toBase58() === RHL_MINT.toBase58()) {
-                const voltAmount = Math.round(10 * Math.pow(10, 9)); // فرضا استهلاك 10 عملات VOLT ديسيمالز 9
-                const senderVoltATA = getAssociatedTokenAddressSync(VOLT_MINT, senderPubkey, false, TOKEN_PROGRAM_ID);
-                const receiverVoltATA = getAssociatedTokenAddressSync(VOLT_MINT, VOLT_TREASURY, false, TOKEN_PROGRAM_ID);
-
-                // التحقق من حساب الخزينة للـ VOLT
-                const recVoltInfo = await connection.getAccountInfo(receiverVoltATA);
-                if (!recVoltInfo) {
-                    instructions.push(
-                        createAssociatedTokenAccountInstruction(senderPubkey, receiverVoltATA, VOLT_TREASURY, VOLT_MINT, TOKEN_PROGRAM_ID)
-                    );
-                }
-
-                // إضافة تعليمة الخصم الإضافية في نفس المعاملة
-                instructions.push(
-                    createTransferCheckedInstruction(
-                        senderVoltATA,
-                        VOLT_MINT,
-                        receiverVoltATA,
-                        senderPubkey,
-                        voltAmount,
-                        9,
-                        [],
-                        TOKEN_PROGRAM_ID
-                    )
                 );
+
+                instructions.push(transferInstruction);
             }
         }
 
-        // بناء رسومة المعاملة بنظام الإقحام V0 لدعم المعاملات الكبيرة والمركبة
+        // تجميع كل التعليمات في معاملة واحدة من نوع Version0
         const messageV0 = new TransactionMessage({
             payerKey: senderPubkey,
             recentBlockhash: blockhash,
@@ -243,8 +214,6 @@ app.post('/api/transaction/create', async (req, res) => {
         }).compileToV0Message();
 
         const transaction = new VersionedTransaction(messageV0);
-        
-        // تحويل المعاملة إلى صيغة Base64 لتمريرها للعميل
         const serializedTx = Buffer.from(transaction.serialize()).toString('base64');
 
         res.json({ success: true, transaction: serializedTx });
@@ -255,7 +224,9 @@ app.post('/api/transaction/create', async (req, res) => {
     }
 });
 
+// ==========================================
 // 3. مسار بث المعاملة الموقعة إلى الشبكة
+// ==========================================
 app.post('/api/transaction/broadcast', async (req, res) => {
     try {
         const { tx } = req.body;
@@ -264,9 +235,8 @@ app.post('/api/transaction/broadcast', async (req, res) => {
         const txBuffer = Buffer.from(tx, 'base64');
         const transaction = VersionedTransaction.deserialize(txBuffer);
 
-        // بث المعاملة للشبكة
         const txHash = await connection.sendTransaction(transaction, {
-            skipPreflight: false,
+            skipPreflight: false, // من الأفضل تركه false لاكتشاف الأخطاء بدقة
             preflightCommitment: 'confirmed'
         });
 
